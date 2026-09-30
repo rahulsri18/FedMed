@@ -1,0 +1,112 @@
+version: "3.8"
+
+# FedMed: Cross-Silo Federated Learning Engine for Brain Tumor Segmentation
+# Owner: M1 (Server & Orchestration Lead)
+
+services:
+  # 1. Central Flower Orchestrator
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: fedmed-server
+    command: python -m server.server --host 0.0.0.0 --port 8080 --rounds 5 --encrypted --min-clients 3
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s = socket.socket(); s.connect((\"127.0.0.1\", 8080)); s.close()' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - fedmed-network
+    restart: unless-stopped
+
+  # 2. Hospital Silo 1 (St. Jude Medical)
+  hospital-node-1:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    container_name: fedmed-hospital-node-1
+    environment:
+      - NODE_ID=1
+      - PORT=8081
+      - SERVER_ADDRESS=server:8080
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fedmed-network
+    restart: on-failure
+
+  # 3. Hospital Silo 2 (Charité Berlin)
+  hospital-node-2:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    container_name: fedmed-hospital-node-2
+    environment:
+      - NODE_ID=2
+      - PORT=8082
+      - SERVER_ADDRESS=server:8080
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fedmed-network
+    restart: on-failure
+
+  # 4. Hospital Silo 3 (Mayo Clinic Oncology)
+  hospital-node-3:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    container_name: fedmed-hospital-node-3
+    environment:
+      - NODE_ID=3
+      - PORT=8083
+      - SERVER_ADDRESS=server:8080
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fedmed-network
+    restart: on-failure
+
+  # 5. FastAPI Backend (Telemetry WebSocket + Scan Slice Server)
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: fedmed-api
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - fedmed-network
+    restart: unless-stopped
+
+  # 6. React + Vite Dashboard (Canvas MRI Viewer + Recharts)
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: fedmed-dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - fedmed-network
+    restart: unless-stopped
+
+networks:
+  fedmed-network:
+    driver: bridge

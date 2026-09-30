@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package fedmed.network;
+
+// Owner: M4 (Network & API Lead)
+// Auxiliary gRPC Channel for Heartbeats, Health Checks, and CKKS Public Key Distribution
+
+service AuxiliaryService {
+  // Check connectivity and operational status of a hospital silo
+  rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Distribute TenSEAL CKKS evaluation keys (Galois + relin keys) to the central server
+  rpc DistributeEvaluationKey (KeyDistributionRequest) returns (KeyDistributionResponse);
+
+  // Periodic heartbeat sent by hospital clients to maintain session in FL consortium
+  rpc SendHeartbeat (HeartbeatPing) returns (HeartbeatPong);
+}
+
+message HealthCheckRequest {
+  int32 node_id = 1;
+  string node_name = 2;
+  int64 timestamp = 3;
+}
+
+message HealthCheckResponse {
+  enum Status {
+    UNKNOWN = 0;
+    HEALTHY = 1;
+    BUSY_TRAINING = 2;
+    DEGRADED = 3;
+    UNHEALTHY = 4;
+  }
+  Status status = 1;
+  string version = 2;
+  int64 server_time = 3;
+  string message = 4;
+}
+
+message KeyDistributionRequest {
+  int32 node_id = 1;
+  string key_type = 2; // e.g. "CKKS_PUBLIC_EVALUATION"
+  bytes public_context_bytes = 3;
+}
+
+message KeyDistributionResponse {
+  bool acknowledged = 1;
+  string fingerprint = 2;
+  string message = 3;
+}
+
+message HeartbeatPing {
+  int32 node_id = 1;
+  int32 current_round = 2;
+  int64 timestamp = 3;
+  double memory_usage_mb = 4;
+  double gpu_utilization = 5;
+}
+
+message HeartbeatPong {
+  bool acknowledged = 1;
+  int64 server_time = 2;
+  int32 current_server_round = 3;
+  string next_action = 4; // e.g. "WAIT_FOR_FIT", "START_TRAINING"
+}
