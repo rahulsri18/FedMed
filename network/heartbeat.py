@@ -43,18 +43,21 @@ class HeartbeatMonitor:
             1: NodeState(
                 node_id=1,
                 name="Hospital Silo 1 (St. Jude Medical)",
+                status="active",
                 dice=0.76,
                 upload_ms=812,
             ),
             2: NodeState(
                 node_id=2,
                 name="Hospital Silo 2 (Charité Berlin)",
+                status="active",
                 dice=0.79,
                 upload_ms=920,
             ),
             3: NodeState(
                 node_id=3,
                 name="Hospital Silo 3 (Mayo Oncology)",
+                status="active",
                 dice=0.81,
                 upload_ms=780,
             ),

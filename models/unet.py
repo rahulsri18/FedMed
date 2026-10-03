@@ -100,7 +100,7 @@ class Compact3DUNet(nn.Module if TORCH_AVAILABLE else object):
         self.num_res_units = num_res_units
         self.norm_type = norm_clean
 
-        if MONAI_AVAILABLE and TORCH_AVAILABLE:
+        if MONAI_AVAILABLE and TORCH_AVAILABLE and norm_clean == "group":
             monai_norm = Norm.INSTANCE if norm_clean == "instance" else Norm.GROUP
             self.monai_net = MonaiUNet(
                 spatial_dims=3,
