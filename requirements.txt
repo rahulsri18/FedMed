@@ -12,7 +12,7 @@ scipy==1.12.0
 numpy==1.26.4
 
 # Privacy: Homomorphic Encryption & Differential Privacy (Owner: M3)
-tenseal==0.3.14
+tenseal==0.3.18
 
 # Backend, Telemetry & Networking (Owner: M4)
 fastapi==0.110.0
