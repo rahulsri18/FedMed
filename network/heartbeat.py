@@ -13,10 +13,17 @@ logger = logging.getLogger("FedMed.Network.Heartbeat")
 
 @dataclass
 class NodeState:
+    """Runtime state and telemetry for one hospital node."""
+
     node_id: int
     name: str
-    status: str = "active"  # "active", "busy", "disconnected", "error"
+
+    # A node is considered disconnected until it sends
+    # its first heartbeat.
+    status: str = "disconnected"
+
     last_seen: float = field(default_factory=time.time)
+
     current_round: int = 0
     dice: float = 0.75
     upload_ms: int = 850
@@ -24,14 +31,36 @@ class NodeState:
 
 
 class HeartbeatMonitor:
-    """Monitors live connection states of the 3 hospital silos."""
+    """Monitors live connection states of the hospital silos."""
 
-    def __init__(self, timeout_threshold_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        timeout_threshold_seconds: float = 15.0,
+    ) -> None:
         self.timeout_threshold = timeout_threshold_seconds
+
         self.nodes: dict[int, NodeState] = {
-            1: NodeState(node_id=1, name="Hospital Silo 1 (St. Jude Medical)", dice=0.76, upload_ms=812),
-            2: NodeState(node_id=2, name="Hospital Silo 2 (Charité Berlin)", dice=0.79, upload_ms=920),
-            3: NodeState(node_id=3, name="Hospital Silo 3 (Mayo Oncology)", dice=0.81, upload_ms=780),
+            1: NodeState(
+                node_id=1,
+                name="Hospital Silo 1 (St. Jude Medical)",
+                status="active",
+                dice=0.76,
+                upload_ms=812,
+            ),
+            2: NodeState(
+                node_id=2,
+                name="Hospital Silo 2 (Charité Berlin)",
+                status="active",
+                dice=0.79,
+                upload_ms=920,
+            ),
+            3: NodeState(
+                node_id=3,
+                name="Hospital Silo 3 (Mayo Oncology)",
+                status="active",
+                dice=0.81,
+                upload_ms=780,
+            ),
         }
 
     def record_heartbeat(
@@ -41,48 +70,99 @@ class HeartbeatMonitor:
         status: str = "active",
         dice: float | None = None,
         upload_ms: int | None = None,
+        bytes_transferred: int | None = None,
     ) -> None:
-        """Update node heartbeat timestamp and telemetry."""
+        """Record a heartbeat and update node telemetry."""
+
         now = time.time()
+
+        # Register previously unknown nodes.
         if node_id not in self.nodes:
-            self.nodes[node_id] = NodeState(node_id=node_id, name=f"Hospital Node {node_id}")
+            self.nodes[node_id] = NodeState(
+                node_id=node_id,
+                name=f"Hospital Node {node_id}",
+                status="disconnected",
+            )
 
         node = self.nodes[node_id]
+
+        # Update liveness.
         node.last_seen = now
         node.status = status
         node.current_round = round_num
+
+        # Update optional telemetry.
         if dice is not None:
             node.dice = dice
+
         if upload_ms is not None:
             node.upload_ms = upload_ms
 
-        logger.debug("[Heartbeat] Node %d heartbeat recorded at %.2f", node_id, now)
+        if bytes_transferred is not None:
+            node.bytes_transferred = bytes_transferred
+
+        logger.info(
+            "[Heartbeat] Node %d | status=%s | round=%d",
+            node_id,
+            node.status,
+            node.current_round,
+        )
 
     def check_timeouts(self) -> list[int]:
-        """Check all nodes for timeout and update status to 'disconnected'."""
+        """
+        Check all nodes for missed heartbeats.
+
+        A node becomes disconnected when it has not sent
+        a heartbeat within the configured timeout period.
+        """
+
         now = time.time()
         timed_out: list[int] = []
+
         for node_id, state in self.nodes.items():
-            if (now - state.last_seen > self.timeout_threshold) and state.status != "disconnected":
-                logger.warning("[Heartbeat] Node %d timed out (no ping for %.1fs)!",
-                               node_id, now - state.last_seen)
+            elapsed = now - state.last_seen
+
+            if (
+                elapsed > self.timeout_threshold
+                and state.status != "disconnected"
+            ):
+                logger.warning(
+                    "[Heartbeat] Node %d timed out "
+                    "(no heartbeat for %.1fs)",
+                    node_id,
+                    elapsed,
+                )
+
                 state.status = "disconnected"
                 timed_out.append(node_id)
+
         return timed_out
 
     def get_active_nodes_count(self) -> int:
-        """Return count of healthy active nodes."""
+        """Return the number of currently active hospital nodes."""
+
         self.check_timeouts()
-        return sum(1 for n in self.nodes.values() if n.status == "active")
+
+        return sum(
+            1
+            for node in self.nodes.values()
+            if node.status == "active"
+        )
 
     def get_telemetry_summary(self) -> list[dict[str, Any]]:
-        """Return telemetry format compatible with dashboard and FastAPI WebSocket."""
+        """
+        Return live telemetry in a format compatible
+        with the FastAPI REST and WebSocket APIs.
+        """
+
         self.check_timeouts()
+
         return [
             {
                 "id": node.node_id,
                 "name": node.name,
                 "status": node.status,
+                "current_round": node.current_round,
                 "dice": node.dice,
                 "upload_ms": node.upload_ms,
                 "bytes": node.bytes_transferred,
