@@ -10,7 +10,7 @@ services:
       context: .
       dockerfile: server/Dockerfile
     container_name: fedmed-server
-    command: python -m server.server --host 0.0.0.0 --port 8080 --rounds 5 --encrypted --min-clients 3
+    command: python -m server.server --host 0.0.0.0 --port 8080 --rounds 5 --encrypted --min-clients 3 --min-quorum 2 --api-url http://api:8000
     ports:
       - "8080:8080"
     healthcheck:
@@ -33,6 +33,7 @@ services:
       - NODE_ID=1
       - PORT=8081
       - SERVER_ADDRESS=server:8080
+      - API_URL=http://api:8000
     depends_on:
       server:
         condition: service_healthy
@@ -50,6 +51,7 @@ services:
       - NODE_ID=2
       - PORT=8082
       - SERVER_ADDRESS=server:8080
+      - API_URL=http://api:8000
     depends_on:
       server:
         condition: service_healthy
@@ -67,6 +69,7 @@ services:
       - NODE_ID=3
       - PORT=8083
       - SERVER_ADDRESS=server:8080
+      - API_URL=http://api:8000
     depends_on:
       server:
         condition: service_healthy

@@ -55,20 +55,14 @@ class FedMedFedAvg(FedAvg if FLWR_AVAILABLE else object):
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
         min_fit_clients: int = 3,
-        min_evaluate_clients: int = 3,
-        min_available_clients: int = 3,
+        min_evaluate_clients: int = 2,
+        min_available_clients: int = 2,
+        min_quorum_clients: int = 2,
         encrypted: bool = True,
         on_round_complete: Callable[[dict[str, Any]], None] | None = None,
         **kwargs,
     ) -> None:
-        """Initialize FedMed FedAvg strategy.
-        
-        Args:
-            fraction_fit: Fraction of available clients sampled for training (1.0 = all 3 hospitals).
-            min_fit_clients: Minimum clients required to start a fit round.
-            encrypted: Whether to perform aggregation on CKKS ciphertexts.
-            on_round_complete: Optional telemetry callback hooking into FastAPI WebSocket.
-        """
+        """Initialize FedMed FedAvg strategy with quorum threshold and mid-round failure survival."""
         if FLWR_AVAILABLE:
             super().__init__(
                 fraction_fit=fraction_fit,
@@ -79,12 +73,30 @@ class FedMedFedAvg(FedAvg if FLWR_AVAILABLE else object):
                 **kwargs,
             )
         self.encrypted = encrypted
+        self.min_quorum_clients = min_quorum_clients
         self.on_round_complete = on_round_complete
         self.current_round = 0
         logger.info(
-            "[FedMed-Server] FedMedFedAvg strategy initialized. Encrypted Mode=%s, Min Clients=%d",
-            self.encrypted, min_fit_clients
+            "[FedMed-Server] FedMedFedAvg strategy initialized. Encrypted Mode=%s, Target Min Clients=%d, Quorum=%d",
+            self.encrypted, min_fit_clients, min_quorum_clients
         )
+
+    def configure_fit(
+        self, server_round: int, parameters: Any, client_manager: Any
+    ) -> list[tuple[Any, Any]]:
+        """Configure the next round of training, broadcasting round parameters and encryption state."""
+        self.current_round = server_round
+        if FLWR_AVAILABLE:
+            client_instructions = super().configure_fit(server_round, parameters, client_manager)
+            # Inject round number and encryption flag into client config
+            updated_instructions = []
+            for client, fit_ins in client_instructions:
+                config = dict(fit_ins.config or {})
+                config["server_round"] = server_round
+                config["encrypted"] = self.encrypted
+                updated_instructions.append((client, FitIns(fit_ins.parameters, config)))
+            return updated_instructions
+        return []
 
     def aggregate_fit(
         self,
@@ -97,9 +109,23 @@ class FedMedFedAvg(FedAvg if FLWR_AVAILABLE else object):
         num_successful = len(results)
         num_failures = len(failures)
 
-        logger.info("=" * 60)
+        logger.info("=" * 65)
         logger.info("[FedMed-Server] >>> Communication Round %d Fit Phase Started <<<", server_round)
         logger.info("[FedMed-Server] Node reports received: %d successful, %d failed", num_successful, num_failures)
+
+        # Quorum verification
+        if num_successful < self.min_quorum_clients:
+            logger.warning(
+                "[FedMed-Server] Quorum failure in round %d! Received %d updates, but minimum quorum is %d. Aborting aggregation.",
+                server_round, num_successful, self.min_quorum_clients
+            )
+            return None, {"error": "quorum_failure", "successful": num_successful}
+
+        if num_failures > 0:
+            logger.warning(
+                "[FedMed-Server] Mid-round node failure detected (%d failed)! Quorum threshold (%d) met. Surviving dropout gracefully.",
+                num_failures, self.min_quorum_clients
+            )
 
         if not results:
             logger.warning("[FedMed-Server] No successful client updates received in round %d!", server_round)
@@ -122,11 +148,13 @@ class FedMedFedAvg(FedAvg if FLWR_AVAILABLE else object):
 
             parsed_results.append((ndarrays, num_examples))
             node_telemetry.append({
-                "id": client_id,
+                "id": int(client_id) if str(client_id).isdigit() else 1,
                 "status": "active",
                 "samples": num_examples,
-                "dice": metrics.get("dice", 0.75),
-                "loss": metrics.get("loss", 0.35),
+                "dice": float(metrics.get("dice", 0.75)),
+                "loss": float(metrics.get("loss", 0.35)),
+                "upload_ms": int(metrics.get("upload_ms", 850)),
+                "bytes": int(metrics.get("upload_bytes", 5242880)),
             })
 
         # Structured logging of aggregation mode
@@ -145,6 +173,8 @@ class FedMedFedAvg(FedAvg if FLWR_AVAILABLE else object):
             "phase": "aggregated",
             "encrypted": self.encrypted,
             "node_count": num_successful,
+            "node_failures": num_failures,
+            "nodes": node_telemetry,
         }
         if self.on_round_complete:
             self.on_round_complete(metrics_aggregated)
@@ -152,6 +182,7 @@ class FedMedFedAvg(FedAvg if FLWR_AVAILABLE else object):
         if FLWR_AVAILABLE and aggregated_weights and isinstance(aggregated_weights[0], np.ndarray):
             return ndarrays_to_parameters(aggregated_weights), metrics_aggregated
         return aggregated_weights, metrics_aggregated
+
 
     def aggregate_evaluate(
         self,

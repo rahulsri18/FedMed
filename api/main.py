@@ -8,19 +8,25 @@ Usage:
 import asyncio
 import json
 import logging
+from typing import Any
 
-import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
+from privacy import compute_privacy_budget
+from privacy.audit import run_privacy_audit
+
 from .models import (
+    ControlActionResponse,
     GlobalMetrics,
+    HeartbeatPayload,
     NodeTelemetry,
     PrivacyBudget,
     ScanMetadata,
     TelemetryPayload,
 )
+from .mri_generator import VOLUME_CACHE
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FedMed.API")
@@ -28,7 +34,7 @@ logger = logging.getLogger("FedMed.API")
 app = FastAPI(
     title="FedMed Federated Learning API",
     description="Cross-Silo FL Telemetry WebSocket & MRI Brain Tumor Scan REST API",
-    version="0.1.0",
+    version="1.0.0",
 )
 
 # Enable CORS for frontend dashboard
@@ -40,180 +46,429 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simulated in-memory database of BraTS scans
-MOCK_SCANS = [
-    ScanMetadata(id="BraTS2021_00001", name="Patient 001 - High-Grade Glioblastoma", assigned_hospital=1),
-    ScanMetadata(id="BraTS2021_00002", name="Patient 002 - Astrocytoma IDH-Mutant", assigned_hospital=2),
-    ScanMetadata(id="BraTS2021_00003", name="Patient 003 - Oligodendroglioma", assigned_hospital=3),
+PATIENT_METADATA = [
+    ScanMetadata(
+        id="BraTS2021_00001",
+        name="Patient 001 - High-Grade Glioblastoma",
+        diagnosis="Glioblastoma Multiforme (WHO Grade IV) - Right Temporal",
+        modalities=["FLAIR", "T1ce", "T2", "T1"],
+        dimensions=[64, 64, 64],
+        assigned_hospital=1,
+        tumor_volume_cm3=18.4,
+    ),
+    ScanMetadata(
+        id="BraTS2021_00002",
+        name="Patient 002 - Astrocytoma IDH-Mutant",
+        diagnosis="Astrocytoma IDH-Mutant (WHO Grade III) - Left Frontal",
+        modalities=["FLAIR", "T1ce", "T2", "T1"],
+        dimensions=[64, 64, 64],
+        assigned_hospital=2,
+        tumor_volume_cm3=12.1,
+    ),
+    ScanMetadata(
+        id="BraTS2021_00003",
+        name="Patient 003 - Oligodendroglioma",
+        diagnosis="Oligodendroglioma 1p/19q-codeleted (WHO Grade II)",
+        modalities=["FLAIR", "T1ce", "T2", "T1"],
+        dimensions=[64, 64, 64],
+        assigned_hospital=3,
+        tumor_volume_cm3=8.7,
+    ),
 ]
 
+HOSPITAL_NAMES = {
+    1: "St. Jude Medical Silo",
+    2: "Charité Berlin Silo",
+    3: "Mayo Clinic Oncology",
+}
 
-def generate_synthetic_mri_png(slice_idx: int, is_mask: bool = False) -> bytes:
-    """Generates a synthetic 2D 128x128 grayscale MRI slice or colored tumor mask as PNG bytes."""
-    size = 128
-    y, x = np.ogrid[:size, :size]
-    center = (size // 2, size // 2)
-    radius = size // 2 - 12
-    
-    # Brain boundary
-    dist_from_center = np.sqrt((x - center[0])**2 + (y - center[1])**2)
-    brain_mask = dist_from_center <= radius
 
-    if not is_mask:
-        # Grayscale MRI brain tissue
-        img = np.zeros((size, size), dtype=np.uint8)
-        img[brain_mask] = 130 + np.random.randint(-15, 15, size=np.sum(brain_mask))
-        
-        # Tumor hyperintensity
-        t_dist = np.sqrt((x - (center[0] + 16))**2 + (y - (center[1] - 12))**2)
-        tumor_region = (t_dist <= 18) & brain_mask
-        img[tumor_region] = 235
-    else:
-        # 3-channel RGBA mask: Green = WT (Whole Tumor), Red = ET (Enhancing)
-        rgba = np.zeros((size, size, 4), dtype=np.uint8)
-        t_dist = np.sqrt((x - (center[0] + 16))**2 + (y - (center[1] - 12))**2)
-        wt = (t_dist <= 20) & brain_mask
-        tc = (t_dist <= 14) & brain_mask
-        et = (t_dist <= 8) & brain_mask
+class FederatedTelemetryState:
+    """Thread-safe centralized telemetry state synchronizing Flower orchestrator and dashboard."""
 
-        # Whole Tumor (Green)
-        rgba[wt] = [34, 197, 94, 160]
-        # Tumor Core (Yellow)
-        rgba[tc] = [234, 179, 8, 200]
-        # Enhancing Tumor (Red)
-        rgba[et] = [239, 68, 68, 240]
+    def __init__(self):
+        self.current_round = 1
+        self.phase = "training"  # training, uploading, aggregating, evaluating, idle
+        self.encrypted = True
+        self.active_scan_id = "BraTS2021_00001"
+        self.auto_step = True
+        self.connected_clients: list[WebSocket] = []
 
-    # Simple PNG format encoder (raw uncompressed BMP or minimal PNG chunk)
-    # Using lightweight BMP header for zero-dependency native byte generation:
-    if not is_mask:
-        # 8-bit grayscale BMP
-        header = bytearray(54 + 1024)
-        header[0:2] = b'BM'
-        file_size = 54 + 1024 + size * size
-        header[2:6] = file_size.to_bytes(4, 'little')
-        header[10:14] = (54 + 1024).to_bytes(4, 'little')
-        header[14:18] = (40).to_bytes(4, 'little')
-        header[18:22] = size.to_bytes(4, 'little')
-        header[22:26] = size.to_bytes(4, 'little')
-        header[26:28] = (1).to_bytes(2, 'little')
-        header[28:30] = (8).to_bytes(2, 'little')
-        header[30:34] = (0).to_bytes(4, 'little')
-        # Palette
-        for i in range(256):
-            header[54 + i * 4 : 54 + i * 4 + 4] = bytes([i, i, i, 0])
-        return bytes(header) + np.flipud(img).tobytes()
-    else:
-        # 32-bit RGBA BMP
-        header = bytearray(54)
-        header[0:2] = b'BM'
-        file_size = 54 + size * size * 4
-        header[2:6] = file_size.to_bytes(4, 'little')
-        header[10:14] = (54).to_bytes(4, 'little')
-        header[14:18] = (40).to_bytes(4, 'little')
-        header[18:22] = size.to_bytes(4, 'little')
-        header[22:26] = size.to_bytes(4, 'little')
-        header[26:28] = (1).to_bytes(2, 'little')
-        header[28:30] = (32).to_bytes(2, 'little')
-        # Flip vertically for BMP
-        flipped = np.flipud(rgba)
-        # Convert RGBA to BGRA
-        bgra = np.zeros_like(flipped)
-        bgra[:, :, 0] = flipped[:, :, 2]
-        bgra[:, :, 1] = flipped[:, :, 1]
-        bgra[:, :, 2] = flipped[:, :, 0]
-        bgra[:, :, 3] = flipped[:, :, 3]
-        return bytes(header) + bgra.tobytes()
+        # Hospital nodes tracking
+        self.nodes: dict[int, dict[str, Any]] = {
+            1: {
+                "id": 1,
+                "name": HOSPITAL_NAMES[1],
+                "status": "active",
+                "dice": 0.76,
+                "upload_ms": 812,
+                "bytes": 5242880,
+                "dropped_out": False,
+            },
+            2: {
+                "id": 2,
+                "name": HOSPITAL_NAMES[2],
+                "status": "active",
+                "dice": 0.78,
+                "upload_ms": 890,
+                "bytes": 5242880,
+                "dropped_out": False,
+            },
+            3: {
+                "id": 3,
+                "name": HOSPITAL_NAMES[3],
+                "status": "active",
+                "dice": 0.81,
+                "upload_ms": 765,
+                "bytes": 5242880,
+                "dropped_out": False,
+            },
+        }
+
+        # Convergence history
+        self.history = [
+            {"round": 1, "dice": 0.68, "loss": 0.44},
+            {"round": 2, "dice": 0.72, "loss": 0.39},
+            {"round": 3, "dice": 0.75, "loss": 0.34},
+            {"round": 4, "dice": 0.79, "loss": 0.30},
+        ]
+
+    def get_global_metrics(self) -> GlobalMetrics:
+        # Active nodes average
+        active_nodes = [n for n in self.nodes.values() if n["status"] != "offline"]
+        if active_nodes:
+            mean_dice = sum(n["dice"] for n in active_nodes) / len(active_nodes)
+        else:
+            mean_dice = 0.70
+        loss = max(0.12, 0.48 / (1.0 + self.current_round * 0.16))
+        return GlobalMetrics(loss=float(round(loss, 4)), dice=float(round(mean_dice, 4)))
+
+    def get_privacy_budget(self) -> PrivacyBudget:
+        spent = compute_privacy_budget(
+            rounds=self.current_round,
+            local_epochs=2,
+            noise_multiplier=0.8,
+            sample_rate=0.25,
+            delta=1e-5,
+        )
+        return PrivacyBudget(epsilon=5.0, delta=1e-5, epsilon_spent=float(round(spent, 2)))
+
+    def get_node_telemetry_list(self) -> list[NodeTelemetry]:
+        res = []
+        for n_id, data in self.nodes.items():
+            res.append(
+                NodeTelemetry(
+                    id=n_id,
+                    name=data["name"],
+                    status="offline" if data.get("dropped_out", False) else data["status"],
+                    dice=float(round(data["dice"], 4)),
+                    upload_ms=int(data["upload_ms"]),
+                    bytes=int(data["bytes"] if self.encrypted else data["bytes"] // 5),
+                )
+            )
+        return res
+
+    def get_payload(self) -> TelemetryPayload:
+        return TelemetryPayload(
+            round=self.current_round,
+            phase=self.phase,
+            global_metrics=self.get_global_metrics(),
+            nodes=self.get_node_telemetry_list(),
+            privacy=self.get_privacy_budget(),
+            encrypted=self.encrypted,
+        )
+
+    def step_round(self):
+        self.current_round = (self.current_round % 15) + 1
+        r = self.current_round
+
+        # Update node scores
+        for nid, node in self.nodes.items():
+            if not node.get("dropped_out", False):
+                node["dice"] = min(0.94, float(round(0.72 + nid * 0.02 + r * 0.022, 4)))
+                node["upload_ms"] = 750 + nid * 40 + (r % 3) * 15
+
+        gm = self.get_global_metrics()
+        self.history.append({"round": r, "dice": gm.dice, "loss": gm.loss})
+        if len(self.history) > 20:
+            self.history.pop(0)
+
+    async def broadcast_telemetry(self):
+        payload = self.get_payload().model_dump(by_alias=True)
+        message = json.dumps(payload)
+        for ws in list(self.connected_clients):
+            try:
+                await ws.send_text(message)
+            except Exception:  # noqa: BLE001
+                if ws in self.connected_clients:
+                    self.connected_clients.remove(ws)
+
+
+TELEMETRY_STATE = FederatedTelemetryState()
 
 
 @app.get("/")
 def read_root():
     return {
         "status": "online",
-        "service": "FedMed Backend API",
-        "version": "0.1.0",
-        "description": "Federated Brain Tumor Segmentation API",
+        "service": "FedMed Federated Learning API",
+        "version": "1.0.0",
+        "active_nodes": len([n for n in TELEMETRY_STATE.nodes.values() if not n.get("dropped_out")]),
+        "current_round": TELEMETRY_STATE.current_round,
+        "encryption": "CKKS Homomorphic" if TELEMETRY_STATE.encrypted else "Plaintext FedAvg",
     }
 
 
 @app.get("/scans", response_model=list[ScanMetadata])
 def get_scans():
     """List available BraTS patient cases."""
-    # TODO(M4): Query data/ directory or database for registered patient volumes
-    return MOCK_SCANS
+    return PATIENT_METADATA
 
 
 @app.get("/scans/{scan_id}/slice/{axis}/{index}")
-def get_scan_slice(scan_id: str, axis: str, index: int):
-    """Retrieve a 2D MRI slice along an axis (axial, sagittal, coronal)."""
-    # TODO(M4): Implement real NIfTI slice extraction via nibabel/MONAI
-    img_bytes = generate_synthetic_mri_png(slice_idx=index, is_mask=False)
-    return Response(content=img_bytes, media_type="image/bmp")
+def get_scan_slice(
+    scan_id: str,
+    axis: str = "axial",
+    index: int = 32,
+    modality: str = Query("FLAIR", description="Acquisition modality: FLAIR, T1ce, T2, T1"),
+    wl: float = Query(0.5, description="Window Level"),
+    ww: float = Query(1.0, description="Window Width"),
+):
+    """Retrieve a 2D MRI slice along an axis (axial, sagittal, coronal) as PNG."""
+    png_bytes = VOLUME_CACHE.get_slice(
+        scan_id=scan_id,
+        axis=axis,
+        index=index,
+        modality=modality,
+        window_level=wl,
+        window_width=ww,
+    )
+    return Response(content=png_bytes, media_type="image/png")
 
 
 @app.get("/scans/{scan_id}/mask/{index}")
-def get_scan_mask(scan_id: str, index: int):
-    """Retrieve the multi-class tumor segmentation mask overlay for a slice."""
-    # TODO(M4): Extract predicted or ground-truth tumor masks (WT, TC, ET)
-    mask_bytes = generate_synthetic_mri_png(slice_idx=index, is_mask=True)
-    return Response(content=mask_bytes, media_type="image/bmp")
+def get_scan_mask_axial_default(
+    scan_id: str,
+    index: int,
+    wt: bool = Query(True, description="Whole Tumor (Green)"),
+    tc: bool = Query(True, description="Tumor Core (Amber)"),
+    et: bool = Query(True, description="Enhancing Tumor (Coral)"),
+    opacity: float = Query(0.75, description="Overlay opacity [0..1]"),
+):
+    """Retrieve axial tumor segmentation overlay mask (RGBA PNG)."""
+    mask_bytes = VOLUME_CACHE.get_mask_slice(
+        scan_id=scan_id,
+        axis="axial",
+        index=index,
+        show_wt=wt,
+        show_tc=tc,
+        show_et=et,
+        opacity=opacity,
+    )
+    return Response(content=mask_bytes, media_type="image/png")
 
+
+@app.get("/scans/{scan_id}/mask/{axis}/{index}")
+def get_scan_mask(
+    scan_id: str,
+    axis: str = "axial",
+    index: int = 32,
+    wt: bool = Query(True, description="Whole Tumor (Green)"),
+    tc: bool = Query(True, description="Tumor Core (Amber)"),
+    et: bool = Query(True, description="Enhancing Tumor (Coral)"),
+    opacity: float = Query(0.75, description="Overlay opacity [0..1]"),
+):
+    """Retrieve multi-class tumor segmentation overlay mask (RGBA PNG)."""
+    mask_bytes = VOLUME_CACHE.get_mask_slice(
+        scan_id=scan_id,
+        axis=axis,
+        index=index,
+        show_wt=wt,
+        show_tc=tc,
+        show_et=et,
+        opacity=opacity,
+    )
+    return Response(content=mask_bytes, media_type="image/png")
+
+
+
+# -------------------------------------------------------------
+# Demo Interactive Control Panel REST Endpoints
+# -------------------------------------------------------------
+
+@app.post("/api/control/dropout/{node_id}", response_model=ControlActionResponse)
+async def trigger_node_dropout(node_id: int):
+    """Simulate mid-round network dropout or server crash for a hospital silo."""
+    if node_id in TELEMETRY_STATE.nodes:
+        TELEMETRY_STATE.nodes[node_id]["dropped_out"] = True
+        TELEMETRY_STATE.nodes[node_id]["status"] = "offline"
+        await TELEMETRY_STATE.broadcast_telemetry()
+        return ControlActionResponse(
+            success=True,
+            action="dropout",
+            message=f"Hospital Node {node_id} ({HOSPITAL_NAMES.get(node_id, '')}) dropped out. Minimum quorum survived.",
+            current_round=TELEMETRY_STATE.current_round,
+            encrypted=TELEMETRY_STATE.encrypted,
+        )
+    return ControlActionResponse(
+        success=False,
+        action="dropout",
+        message=f"Node {node_id} not recognized",
+        current_round=TELEMETRY_STATE.current_round,
+        encrypted=TELEMETRY_STATE.encrypted,
+    )
+
+
+@app.post("/api/control/reconnect/{node_id}", response_model=ControlActionResponse)
+async def trigger_node_reconnect(node_id: int):
+    """Reconnect a previously disconnected hospital silo."""
+    if node_id in TELEMETRY_STATE.nodes:
+        TELEMETRY_STATE.nodes[node_id]["dropped_out"] = False
+        TELEMETRY_STATE.nodes[node_id]["status"] = "active"
+        await TELEMETRY_STATE.broadcast_telemetry()
+        return ControlActionResponse(
+            success=True,
+            action="reconnect",
+            message=f"Hospital Node {node_id} ({HOSPITAL_NAMES.get(node_id, '')}) reconnected successfully.",
+            current_round=TELEMETRY_STATE.current_round,
+            encrypted=TELEMETRY_STATE.encrypted,
+        )
+    return ControlActionResponse(
+        success=False,
+        action="reconnect",
+        message=f"Node {node_id} not recognized",
+        current_round=TELEMETRY_STATE.current_round,
+        encrypted=TELEMETRY_STATE.encrypted,
+    )
+
+
+@app.post("/api/control/toggle-encryption", response_model=ControlActionResponse)
+async def toggle_encryption():
+    """Toggle between TenSEAL CKKS Homomorphic Encryption and Plaintext FedAvg."""
+    TELEMETRY_STATE.encrypted = not TELEMETRY_STATE.encrypted
+    mode_str = "TenSEAL CKKS Homomorphic Encryption" if TELEMETRY_STATE.encrypted else "Plaintext FedAvg"
+    await TELEMETRY_STATE.broadcast_telemetry()
+    return ControlActionResponse(
+        success=True,
+        action="toggle_encryption",
+        message=f"Aggregation scheme switched to: {mode_str}",
+        current_round=TELEMETRY_STATE.current_round,
+        encrypted=TELEMETRY_STATE.encrypted,
+    )
+
+
+@app.post("/api/control/step-round", response_model=ControlActionResponse)
+async def step_round():
+    """Manually step forward one federated communication round."""
+    TELEMETRY_STATE.step_round()
+    TELEMETRY_STATE.phase = "aggregating"
+    await TELEMETRY_STATE.broadcast_telemetry()
+    return ControlActionResponse(
+        success=True,
+        action="step_round",
+        message=f"Stepped forward to Communication Round {TELEMETRY_STATE.current_round}",
+        current_round=TELEMETRY_STATE.current_round,
+        encrypted=TELEMETRY_STATE.encrypted,
+    )
+
+
+@app.post("/api/control/select-scan/{scan_id}", response_model=ControlActionResponse)
+async def select_scan(scan_id: str):
+    """Switch the active patient scan in the 3D MRI viewer."""
+    if scan_id in VOLUME_CACHE.scans:
+        TELEMETRY_STATE.active_scan_id = scan_id
+        await TELEMETRY_STATE.broadcast_telemetry()
+        return ControlActionResponse(
+            success=True,
+            action="select_scan",
+            message=f"Active scan set to {scan_id}",
+            current_round=TELEMETRY_STATE.current_round,
+            encrypted=TELEMETRY_STATE.encrypted,
+        )
+    return ControlActionResponse(
+        success=False,
+        action="select_scan",
+        message=f"Scan {scan_id} not found",
+        current_round=TELEMETRY_STATE.current_round,
+        encrypted=TELEMETRY_STATE.encrypted,
+    )
+
+
+@app.post("/api/heartbeat")
+async def receive_heartbeat(hb: HeartbeatPayload):
+    """Ingest live heartbeat from client node process."""
+    if hb.node_id in TELEMETRY_STATE.nodes and not TELEMETRY_STATE.nodes[hb.node_id].get("dropped_out"):
+        node = TELEMETRY_STATE.nodes[hb.node_id]
+        node["status"] = hb.status
+        if hb.dice is not None:
+            node["dice"] = hb.dice
+        if hb.upload_ms is not None:
+            node["upload_ms"] = hb.upload_ms
+        await TELEMETRY_STATE.broadcast_telemetry()
+    return {"status": "ok"}
+
+
+@app.post("/api/telemetry/round")
+async def receive_round_event(payload: dict):
+    """Ingest round completion webhook from central Flower server."""
+    r = payload.get("round", TELEMETRY_STATE.current_round)
+    TELEMETRY_STATE.current_round = r
+    TELEMETRY_STATE.phase = payload.get("phase", "aggregated")
+    TELEMETRY_STATE.encrypted = payload.get("encrypted", TELEMETRY_STATE.encrypted)
+    await TELEMETRY_STATE.broadcast_telemetry()
+    return {"status": "recorded"}
+
+
+@app.get("/api/privacy/audit")
+def get_privacy_audit():
+    """Execute cryptographic trust model and differential privacy audit."""
+    return run_privacy_audit(target_epsilon=5.0, delta=1e-5, rounds=TELEMETRY_STATE.current_round)
+
+
+@app.get("/api/history")
+def get_convergence_history():
+    """Return historical loss and Dice records across rounds."""
+    return TELEMETRY_STATE.history
+
+
+# -------------------------------------------------------------
+# Throttled Live Telemetry WebSocket
+# -------------------------------------------------------------
 
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
-    """WebSocket endpoint emitting real-time federated round metrics matching the FedMed schema."""
+    """Throttled WebSocket endpoint streaming live round telemetry matching FedMed schema."""
     await websocket.accept()
-    logger.info("[WebSocket] Client connected to /ws/telemetry")
-    current_round = 1
+    TELEMETRY_STATE.connected_clients.append(websocket)
+    logger.info("[WebSocket] New client connected to /ws/telemetry (Total: %d)", len(TELEMETRY_STATE.connected_clients))
+
+    # Send immediate state on connect
+    init_payload = TELEMETRY_STATE.get_payload().model_dump(by_alias=True)
+    await websocket.send_text(json.dumps(init_payload))
+
+    phases = ["training", "encrypting", "uploading", "aggregating", "evaluating"]
+    phase_idx = 0
 
     try:
         while True:
-            # Emit live telemetry cycle
-            telemetry_data = TelemetryPayload(
-                round=current_round,
-                phase="aggregating" if current_round % 2 == 0 else "training",
-                global_metrics=GlobalMetrics(
-                    loss=float(round(0.45 / (1.0 + current_round * 0.15), 4)),
-                    dice=float(round(min(0.92, 0.68 + current_round * 0.035), 4)),
-                ),
-                nodes=[
-                    NodeTelemetry(
-                        id=1,
-                        status="active",
-                        dice=float(round(0.72 + current_round * 0.03, 4)),
-                        upload_ms=812 + (current_round % 3) * 15,
-                        bytes=5242880,
-                    ),
-                    NodeTelemetry(
-                        id=2,
-                        status="active",
-                        dice=float(round(0.74 + current_round * 0.032, 4)),
-                        upload_ms=920 - (current_round % 4) * 20,
-                        bytes=5242880,
-                    ),
-                    NodeTelemetry(
-                        id=3,
-                        status="active",
-                        dice=float(round(0.76 + current_round * 0.028, 4)),
-                        upload_ms=780 + (current_round % 2) * 30,
-                        bytes=5242880,
-                    ),
-                ],
-                privacy=PrivacyBudget(
-                    epsilon=5.0,
-                    delta=1e-5,
-                    epsilon_spent=float(round(min(5.0, 0.8 + current_round * 0.35), 2)),
-                ),
-                encrypted=True,
-            )
+            # Smoothly transition phases
+            phase_idx = (phase_idx + 1) % len(phases)
+            TELEMETRY_STATE.phase = phases[phase_idx]
 
-            # Dump using exact alias so 'global' is emitted
-            payload_json = telemetry_data.model_dump(by_alias=True)
-            await websocket.send_text(json.dumps(payload_json))
+            # When completing a full phase cycle, advance communication round if auto_step is on
+            if phase_idx == 0 and TELEMETRY_STATE.auto_step:
+                TELEMETRY_STATE.step_round()
 
-            current_round = (current_round % 10) + 1
-            await asyncio.sleep(2.5)
+            payload = TELEMETRY_STATE.get_payload().model_dump(by_alias=True)
+            await websocket.send_text(json.dumps(payload))
+
+            # Throttled interval (~2.2 seconds) to avoid UI jitter and ensure smooth 60fps rendering
+            await asyncio.sleep(2.2)
 
     except WebSocketDisconnect:
         logger.info("[WebSocket] Client disconnected from /ws/telemetry")
     except Exception as e:  # noqa: BLE001
-        logger.error("[WebSocket] Telemetry stream error: %s", e)
+        logger.error("[WebSocket] Stream exception: %s", e)
+    finally:
+        if websocket in TELEMETRY_STATE.connected_clients:
+            TELEMETRY_STATE.connected_clients.remove(websocket)

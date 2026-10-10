@@ -14,6 +14,7 @@ class GlobalMetrics(BaseModel):
 
 class NodeTelemetry(BaseModel):
     id: int = Field(..., description="Hospital node silo identifier", json_schema_extra={"example": 1})
+    name: str = Field(default="", description="Hospital name")
     status: str = Field(..., description="Node operational state", json_schema_extra={"example": "active"})
     dice: float = Field(..., description="Local validation Dice score", json_schema_extra={"example": 0.76})
     upload_ms: int = Field(..., description="Upload latency in milliseconds", json_schema_extra={"example": 812})
@@ -41,6 +42,25 @@ class TelemetryPayload(BaseModel):
 class ScanMetadata(BaseModel):
     id: str = Field(..., json_schema_extra={"example": "BraTS2021_00001"})
     name: str = Field(..., json_schema_extra={"example": "Patient 001 - High-Grade Glioma"})
-    modalities: list[str] = Field(default_factory=lambda: ["T1", "T1ce", "T2", "FLAIR"])
+    diagnosis: str = Field("Glioblastoma Multiforme (WHO Grade IV)")
+    modalities: list[str] = Field(default_factory=lambda: ["FLAIR", "T1ce", "T2", "T1"])
     dimensions: list[int] = Field(default_factory=lambda: [64, 64, 64])
     assigned_hospital: int = Field(1, description="Hospital silo owning this scan")
+    tumor_volume_cm3: float = Field(14.8, description="Estimated tumor volume")
+
+
+class HeartbeatPayload(BaseModel):
+    node_id: int
+    status: str = "active"
+    round: int = 1
+    dice: float | None = None
+    upload_ms: int | None = None
+
+
+class ControlActionResponse(BaseModel):
+    success: bool
+    action: str
+    message: str
+    current_round: int
+    encrypted: bool
+

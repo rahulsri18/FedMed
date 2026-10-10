@@ -10,7 +10,7 @@ $processes = @()
 try {
     # 1. Start Server
     Write-Host "[1/6] Launching Central Flower Orchestrator (port 8080)..." -ForegroundColor Yellow
-    $server = Start-Process python -ArgumentList "-m server.server --port 8080 --rounds 5 --encrypted" -PassThru
+    $server = Start-Process python -ArgumentList "-m server.server --port 8080 --rounds 5 --encrypted --min-quorum 2 --api-url http://127.0.0.1:8000" -PassThru
     $processes += $server
     Start-Sleep -Seconds 2
 

@@ -61,25 +61,32 @@ def aggregate_encrypted(results: list[tuple[list[Any], int]]) -> list[Any]:
 
     aggregated_ciphertexts: list[Any] = []
 
-    # TODO(M1): Implement batch addition and multi-threaded layer aggregation
     for layer_idx in range(num_layers):
         accumulated_layer = None
         for client_ciphertexts, num_samples in results:
-            weight = float(num_samples) / float(total_samples)
-            c = client_ciphertexts[layer_idx]
+            weight = float(num_samples) / float(total_samples) if total_samples > 0 else 1.0 / len(results)
+            layer_payload = client_ciphertexts[layer_idx]
 
-            # In TenSEAL, multiplying ciphertext by scalar weight: c * weight
-            if hasattr(c, "__mul__") and not isinstance(c, dict):
-                weighted_c = c * weight
+            # If layer is a list of chunked ciphertexts
+            if isinstance(layer_payload, list):
+                if accumulated_layer is None:
+                    accumulated_layer = [c * weight if hasattr(c, "__mul__") else c for c in layer_payload]
+                else:
+                    for chunk_idx, c in enumerate(layer_payload):
+                        if hasattr(c, "__mul__"):
+                            accumulated_layer[chunk_idx] = accumulated_layer[chunk_idx] + (c * weight)
+            elif hasattr(layer_payload, "__mul__") and not isinstance(layer_payload, dict):
+                weighted_c = layer_payload * weight
                 if accumulated_layer is None:
                     accumulated_layer = weighted_c
                 else:
-                    accumulated_layer += weighted_c
+                    accumulated_layer = accumulated_layer + weighted_c
             else:
                 # Mock fallback
-                accumulated_layer = c
+                accumulated_layer = layer_payload
 
         aggregated_ciphertexts.append(accumulated_layer)
 
     logger.info("Homomorphic aggregation complete. Zero plaintext leakage verified.")
     return aggregated_ciphertexts
+

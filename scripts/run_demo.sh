@@ -26,7 +26,7 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # 1. Start Flower Central Server
 echo "[1/6] Launching Central Flower Orchestrator (port 8080)..."
-python -m server.server --port 8080 --rounds 5 --encrypted &
+python -m server.server --port 8080 --rounds 5 --encrypted --min-quorum 2 --api-url http://127.0.0.1:8000 &
 PIDS+=($!)
 sleep 2
 

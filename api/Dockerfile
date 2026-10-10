@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY api/ /app/api/
 COPY network/ /app/network/
 COPY data/ /app/data/
+COPY privacy/ /app/privacy/
+COPY models/ /app/models/
 
 EXPOSE 8000
 
