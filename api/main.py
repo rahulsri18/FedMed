@@ -1,6 +1,8 @@
-"""api/main.py - FastAPI Application for FedMed Telemetry & Slice Viewer.
+"""api/main.py
 
+FastAPI Application for FedMed Telemetry & Slice Viewer.
 Owner: M4 (Network & API Lead)
+
 Usage:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 """
@@ -8,6 +10,8 @@ Usage:
 import asyncio
 import json
 import logging
+import threading
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
@@ -28,13 +32,69 @@ from .models import (
 )
 from .mri_generator import VOLUME_CACHE
 
+# ---------------------------------------------------------
+# Logging
+# ---------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FedMed.API")
 
+
+# ---------------------------------------------------------
+# Global gRPC auxiliary server references
+# ---------------------------------------------------------
+
+grpc_server = None
+grpc_service = None
+heartbeat_thread = None
+
+
+# ---------------------------------------------------------
+# FastAPI Lifespan (Optional gRPC auxiliary server)
+# ---------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global grpc_server, grpc_service, heartbeat_thread
+
+    try:
+        from network.grpc_server import create_server, monitor_node_timeouts
+        logger.info("[M4] Starting gRPC auxiliary server on port 50051...")
+        grpc_server, grpc_service = create_server()
+        grpc_server.start()
+        logger.info("[M4] gRPC auxiliary server started on port 50051")
+
+        heartbeat_thread = threading.Thread(
+            target=monitor_node_timeouts,
+            args=(grpc_service,),
+            daemon=True,
+            name="FedMed-Heartbeat-Monitor",
+        )
+        heartbeat_thread.start()
+        logger.info("[M4] Heartbeat timeout monitor thread started")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[M4] Auxiliary gRPC server startup skipped/failed: %s", exc)
+
+    yield
+
+    logger.info("[M4] Shutting down FedMed API services...")
+    if grpc_server is not None:
+        try:
+            grpc_server.stop(grace=3)
+            logger.info("[M4] gRPC auxiliary server stopped")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[M4] Error stopping gRPC server: %s", exc)
+
+
+# ---------------------------------------------------------
+# FastAPI Application
+# ---------------------------------------------------------
+
 app = FastAPI(
     title="FedMed Federated Learning API",
-    description="Cross-Silo FL Telemetry WebSocket & MRI Brain Tumor Scan REST API",
+    description="Cross-Silo Federated Learning Telemetry & MRI Brain Tumor Scan REST API",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Enable CORS for frontend dashboard
@@ -45,6 +105,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------
+# Patient MRI Scan Metadata Registry
+# ---------------------------------------------------------
 
 PATIENT_METADATA = [
     ScanMetadata(
@@ -82,6 +147,10 @@ HOSPITAL_NAMES = {
     3: "Mayo Clinic Oncology",
 }
 
+
+# ---------------------------------------------------------
+# Centralized Telemetry State Engine
+# ---------------------------------------------------------
 
 class FederatedTelemetryState:
     """Thread-safe centralized telemetry state synchronizing Flower orchestrator and dashboard."""
@@ -134,7 +203,6 @@ class FederatedTelemetryState:
         ]
 
     def get_global_metrics(self) -> GlobalMetrics:
-        # Active nodes average
         active_nodes = [n for n in self.nodes.values() if n["status"] != "offline"]
         if active_nodes:
             mean_dice = sum(n["dice"] for n in active_nodes) / len(active_nodes)
@@ -161,6 +229,7 @@ class FederatedTelemetryState:
                     id=n_id,
                     name=data["name"],
                     status="offline" if data.get("dropped_out", False) else data["status"],
+                    current_round=self.current_round,
                     dice=float(round(data["dice"], 4)),
                     upload_ms=int(data["upload_ms"]),
                     bytes=int(data["bytes"] if self.encrypted else data["bytes"] // 5),
@@ -206,6 +275,10 @@ class FederatedTelemetryState:
 
 TELEMETRY_STATE = FederatedTelemetryState()
 
+
+# ---------------------------------------------------------
+# REST Endpoints
+# ---------------------------------------------------------
 
 @app.get("/")
 def read_root():
@@ -290,6 +363,29 @@ def get_scan_mask(
     )
     return Response(content=mask_bytes, media_type="image/png")
 
+
+@app.get("/network/nodes", response_model=list[NodeTelemetry])
+def get_network_nodes():
+    """Return live telemetry for all hospital nodes."""
+    if grpc_service is not None:
+        try:
+            telemetry = grpc_service.heartbeat_monitor.get_telemetry_summary()
+            return [
+                NodeTelemetry(
+                    id=node["id"],
+                    name=node["name"],
+                    status=node["status"],
+                    current_round=node.get("current_round", TELEMETRY_STATE.current_round),
+                    dice=node["dice"],
+                    upload_ms=node["upload_ms"],
+                    bytes=node["bytes"],
+                )
+                for node in telemetry
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[M4] Error reading telemetry from gRPC service: %s", exc)
+
+    return TELEMETRY_STATE.get_node_telemetry_list()
 
 
 # -------------------------------------------------------------
@@ -451,11 +547,9 @@ async def websocket_telemetry(websocket: WebSocket):
 
     try:
         while True:
-            # Smoothly transition phases
             phase_idx = (phase_idx + 1) % len(phases)
             TELEMETRY_STATE.phase = phases[phase_idx]
 
-            # When completing a full phase cycle, advance communication round if auto_step is on
             if phase_idx == 0 and TELEMETRY_STATE.auto_step:
                 TELEMETRY_STATE.step_round()
 
